@@ -1,0 +1,162 @@
+rm(list=ls())
+library(keras)
+install_keras()
+#library(pseudo)
+library(survival)
+library(randomForestSRC) 
+
+
+#============================================================================================================
+# Compute IPCW weights using random survival forest
+# input are survival time (time), censoring indicator (delta) and covariate matrix
+# output is a n*ns matrix containing IPCW weights ordered by unique event times, where n is the number of subjects 
+#         and ns is the number of unique event times.
+#============================================================================================================
+compute_weight_rf_trunc<- function(time,delta,cov){
+  
+  n=length(time)
+  ddw <- data.frame(t=time,d=1-delta,cov)
+  foo=rfsrc(Surv(t, d) ~ ., data=ddw)
+  t.unique=foo$time.interest
+  s=sort(unique(time[delta==1]))  ## unique event times
+  survprob=t(sapply(1:n,function(j) approx(t.unique, foo$survival[j,], xout =s,method="constant",yleft=1)$y)) # n*ns dimension
+  trunc=max(1e-20,min(survprob[survprob>0])) # avoid close to zero prob
+  weight=ifelse(survprob < trunc, 1/trunc, 1/survprob)                        
+  return(weight)
+}
+
+
+#============================================================================================================
+# Compute IPCW pseudo RMST at a single tau using Nelson-Aalen method; tau < the last event time
+# input are survival time (time), censoring indicator (delta), 
+# weight is a n*ns matrix, where n is the number of subjects and ns is the number of unique event times, and these weights
+# will not change in leave-one-out part (see fourmula (9) in Binder:2014.)
+# tau is the landmark time
+# output is a vector of n pseudo values 
+#============================================================================================================
+
+pseudomean_ipcw<-function(time,delta,weight,tau){
+  
+  ## preparing the data
+  n=length(time)
+  pseudo <- data.frame(id=1:n,t=time,delta=delta,weight)
+  
+  # sort in time, if tied, put events before censoring
+  pseudo <- pseudo[order(pseudo$t,-pseudo$delta),]
+  
+  t=pseudo$t
+  delta=pseudo$delta
+  weight=pseudo[,-c(1,2,3)]
+  
+  s=sort(unique(t[delta==1]))
+  ns=length(s)  # the number of intervals
+  D <- do.call(cbind, lapply(1:ns, function(j)  (s[j] == t)*(delta == 1)))
+  Y <- do.call(cbind, lapply(1:ns, function(j)  ifelse(s[j] <= t, 1, 0)))
+  inx=max(which(s<=tau))
+  ttmp=c(0,s)
+  tt=c(ttmp[ttmp<=tau],tau) # add one extra column, may repeat, but diff=0
+  dt=diff(tt)
+  
+  denominator=colSums(Y*weight)
+  numerator=colSums(D*weight)
+  IPCW_CH=cumsum(numerator/denominator)
+  IPCW_surv=exp(-IPCW_CH)
+  surv=c(IPCW_surv[1:inx],IPCW_surv[inx])
+  IPCW_RM=sum(surv*dt)
+  
+  Yw=Y*weight
+  Denominator=matrix(colSums(Yw),n,ns,byrow=TRUE)-Yw
+  Dw=D*weight
+  Numerator=matrix(colSums(Dw),n,ns,byrow=TRUE)-Dw
+  IPCW_CHi=t(apply(Numerator/Denominator,1,cumsum))
+  IPCW_survi=exp(-IPCW_CHi)
+  dt.mat=matrix(dt,nrow=n,ncol=length(dt),byrow=TRUE)
+  survi=cbind(IPCW_survi[,1:inx],IPCW_survi[,inx])
+  IPCW_RMi=rowSums(survi*dt.mat)
+  
+  pseudo_mean=n*IPCW_RM-(n-1)*IPCW_RMi
+  # back to original order
+  pseudo <- as.vector(pseudo_mean[order(pseudo$id)])		#back to original order
+  return(pseudo)
+}
+
+
+# set up a simulation for a two-sample problem
+  set.seed(100)
+  n=1000
+  z=rbinom(n,1,0.5)
+  c0=0.01;
+  times=rexp(n,c0*exp(1*z))  # exp(-tau*exp(z))
+  time.censor=rexp(n,0.02)
+  #time.censor=rexp(n,c0*exp(2*z))
+  d=ifelse(times<time.censor, 1, 0)
+  t <- ifelse(times<time.censor, times, time.censor)
+  
+  sum(d)/length(d)
+  fit <- survfit(Surv(t, d) ~ 1)
+  quantile(fit, seq(0.1, 0.9, by=0.1))$quantile
+  
+  tau=c(5.3,12,20,30,40,55,75,108,140)
+  ntau=length(tau)
+  
+  #compute IPCW weights
+  weights=compute_weight_rf_trunc(t,d,z)
+  #compute pseudo values for all landmark times
+  xx=sapply(tau, function(s) pseudomean_ipcw(t,d,weight=weights,s))
+
+  ## xx normalization
+  min=apply(xx,2,min)
+  max=apply(xx,2,max)
+  xx_norm=sapply(1:ntau, function(s) (xx[,s]-min[s])/(max[s]-min[s]))
+  
+
+  Z=as.matrix(z)
+  # DnnRMST model (one hidden layer is sufficient in this simple case)
+  model <- keras_model_sequential() %>%
+    layer_dense(units=8,  activation = "relu",input_shape = dim(Z)[[2]]) %>%
+    #layer_dropout(rate = 0.2) %>%
+    #layer_dense(units = 4, activation = "relu") %>%
+    #layer_dropout(rate = 0.4) %>%
+    layer_dense(units = dim(xx)[[2]], activation='sigmoid')
+  
+  #use adam instead of rmsprop for optimizer
+  model %>% compile(
+    optimizer = optimizer_adam(lr = 0.01),
+    loss = "mse",
+    metrics = c("mae")
+  )
+  
+   model %>% fit(Z, xx_norm,
+                epochs = 1000, batch_size =256,
+                verbose = 0)
+  
+  # make predictions
+  ypred=model %>% predict(as.matrix(c(0,1)))
+  # convert to original scale
+  ypred_orig=sapply(1:ntau, function(s) {ypred[,s]*(max[s]-min[s])+min[s]})
+
+  ### obtain true values of RMST at tau
+  ntau=length(tau)
+  zs=c(0,1)
+  trueRM=matrix(NA,length(zs),length(tau))
+  for(j in 1:2){
+    for(k in 1:length(tau)){
+      integrand <- function(t) {exp(-c0*exp(1*zs[j])*t)}
+      trueRM[j,k]=integrate(integrand, lower = 0, upper = tau[k])$value 
+    }
+  }
+  
+  trueRM
+  ypred_orig
+
+  
+  #==============================================================================
+  # check with rmst2 function in R
+  # The truncation time, tau, needs to be shorter than or equal to the minimum of the largest observed time on each of the two groups
+  library(survRM2)
+  res=rmst2(t, d, z, tau=tau[2])
+  #fit.rmst=res$RMST.arm0$rmst[1]+(res$RMST.arm1$rmst[1]-res$RMST.arm0$rmst[1])*z
+  res$RMST.arm0$rmst[1];res$RMST.arm1$rmst[1]
+
+  
+  
