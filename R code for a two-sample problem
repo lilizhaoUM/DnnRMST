@@ -1,7 +1,6 @@
 rm(list=ls())
 library(keras)
 install_keras()
-#library(pseudo)
 library(survival)
 library(randomForestSRC) 
 
@@ -107,8 +106,7 @@ pseudomean_ipcw<-function(time,delta,weight,tau){
   ## xx normalization
   min=apply(xx,2,min)
   max=apply(xx,2,max)
-  xx_norm=sapply(1:ntau, function(s) (xx[,s]-min[s])/(max[s]-min[s]))
-  
+  xx_norm=sapply(1:ntau, function(s) (xx[,s]-min[s])/(max[s]-min[s]))  
 
   Z=as.matrix(z)
   # DnnRMST model (one hidden layer is sufficient in this simple case)
@@ -125,8 +123,7 @@ pseudomean_ipcw<-function(time,delta,weight,tau){
     loss = "mse",
     metrics = c("mae")
   )
-  
-   model %>% fit(Z, xx_norm,
+  model %>% fit(Z, xx_norm,
                 epochs = 1000, batch_size =256,
                 verbose = 0)
   
@@ -147,15 +144,13 @@ pseudomean_ipcw<-function(time,delta,weight,tau){
   }
   
   trueRM
-  ypred_orig
-
+  # compare ypred_orig vs trueRM
   
   #==============================================================================
   # check with rmst2 function in R
   # The truncation time, tau, needs to be shorter than or equal to the minimum of the largest observed time on each of the two groups
   library(survRM2)
   res=rmst2(t, d, z, tau=tau[2])
-  #fit.rmst=res$RMST.arm0$rmst[1]+(res$RMST.arm1$rmst[1]-res$RMST.arm0$rmst[1])*z
   res$RMST.arm0$rmst[1];res$RMST.arm1$rmst[1]
 
   
