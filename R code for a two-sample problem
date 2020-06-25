@@ -87,7 +87,7 @@ pseudomean_ipcw<-function(time,delta,weight,tau){
   c0=0.01;
   times=rexp(n,c0*exp(1*z))  # exp(-tau*exp(z))
   time.censor=rexp(n,0.02)
-  #time.censor=rexp(n,c0*exp(2*z))
+  #time.censor=rexp(n,c0*exp(2*z))  # for covariate-dependent censoring
   d=ifelse(times<time.censor, 1, 0)
   t <- ifelse(times<time.censor, times, time.censor)
   
